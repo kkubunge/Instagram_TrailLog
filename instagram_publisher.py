@@ -7,8 +7,12 @@ import base64
 import io
 import json
 import logging
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,6 +32,23 @@ MAX_IG_CAPTION_LEN = 2200
 
 class InstagramPublishError(RuntimeError):
     """인스타그램 게시 또는 공개 이미지 호스팅 중 오류 발생 시 사용하는 예외."""
+
+
+def _find_git_executable() -> str | None:
+    """시스템 PATH 또는 Windows 표준 설치 경로에서 git 실행 파일을 찾는다."""
+    found = shutil.which("git")
+    if found:
+        return found
+    candidates = (
+        Path(r"C:\Program Files\Git\cmd\git.exe"),
+        Path(r"C:\Program Files\Git\bin\git.exe"),
+        Path.home() / "AppData/Local/Atlassian/SourceTree/git_local/cmd/git.exe",
+        Path.home() / "AppData/Local/Programs/Git/cmd/git.exe",
+    )
+    for cand in candidates:
+        if cand.exists():
+            return str(cand)
+    return None
 
 
 def load_published_history(history_path: Path | None = None) -> dict[str, Any]:
@@ -117,31 +138,60 @@ class GitHubMediaHost:
         branch: str | None = None,
         timeout: int = 20,
     ) -> None:
-        self.token = (token or config.GITHUB_TOKEN).strip()
+        self.token = (token if token is not None else config.GITHUB_TOKEN).strip()
         self.repo = (repo or config.GITHUB_REPO).strip().strip("/")
         self.branch = (branch or config.GITHUB_MEDIA_BRANCH).strip()
         self.timeout = timeout
-        if not self.token:
-            raise InstagramPublishError("GITHUB_TOKEN이 설정되어 있지 않습니다.")
+        if not self.token and not _find_git_executable():
+            raise InstagramPublishError(
+                "GITHUB_TOKEN이 설정되어 있지 않고 로컬 git 실행 파일도 찾을 수 없습니다."
+            )
         if not self.repo or "/" not in self.repo:
             raise InstagramPublishError(
                 f"GITHUB_REPO 형식이 올바르지 않습니다: '{self.repo}'"
             )
         self.api_base = f"https://api.github.com/repos/{self.repo}"
         self.session = config.create_http_session()
-        self.session.headers.update(
-            {
-                "Authorization": f"Bearer {self.token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            }
-        )
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        self.session.headers.update(headers)
         self._public_session = config.create_http_session()
 
     def _encode_path(self, remote_path: str) -> str:
         """슬래시 구분자를 유지하면서 경로 세그먼트만 URL 인코딩한다."""
         parts = [p for p in remote_path.strip("/").split("/") if p]
         return "/".join(quote(p, safe="") for p in parts)
+
+    def _raw_url_for(self, remote_path: str) -> str:
+        """지정 원격 경로에 대한 GitHub 공개 raw HTTPS URL을 생성한다."""
+        encoded_path = self._encode_path(remote_path)
+        return (
+            f"https://raw.githubusercontent.com/{self.repo}/"
+            f"{quote(self.branch, safe='')}/{encoded_path}"
+        )
+
+    def _verify_public_raw_url(self, raw_url: str) -> str:
+        """업로드된 공개 raw URL이 비인증 GET 요청으로 정상 이미지 응답을 주는지 확인한다."""
+        last_status = 0
+        for attempt in range(4):
+            if attempt > 0:
+                time.sleep(1.5)
+            pub_resp = self._public_session.get(raw_url, timeout=self.timeout)
+            last_status = pub_resp.status_code
+            ctype = (pub_resp.headers.get("Content-Type") or "").lower()
+            if (
+                last_status == 200
+                and len(pub_resp.content) > 0
+                and ("image" in ctype or "octet-stream" in ctype)
+            ):
+                return raw_url
+        raise InstagramPublishError(
+            f"업로드한 공개 이미지 URL 접근 검증 실패 ({raw_url}): HTTP {last_status}"
+        )
 
     def verify_repo(self) -> dict[str, Any]:
         """대상 GitHub 저장소 존재 여부 및 Public 공개 상태를 확인한다."""
@@ -208,7 +258,7 @@ class GitHubMediaHost:
     def upload_jpeg_bytes(
         self, remote_path: str, jpeg_bytes: bytes, message: str
     ) -> str:
-        """JPEG 바이트를 GitHub 미디어 브랜치에 업로드하고 검증된 공개 raw URL을 반환한다."""
+        """JPEG 바이트를 GitHub REST API로 업로드하고 검증된 공개 raw URL을 반환한다."""
         encoded_path = self._encode_path(remote_path)
         api_url = f"{self.api_base}/contents/{encoded_path}"
 
@@ -227,30 +277,146 @@ class GitHubMediaHost:
                 f"GitHub 이미지 업로드 실패 ({remote_path}): HTTP {resp.status_code} {resp.text[:200]}"
             )
 
-        raw_url = (
-            f"https://raw.githubusercontent.com/{self.repo}/"
-            f"{quote(self.branch, safe='')}/{encoded_path}"
+        return self._verify_public_raw_url(self._raw_url_for(remote_path))
+
+    def _run_git(
+        self, args: list[str], cwd: Path, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        """비대화형 모드로 git CLI 명령을 실행한다."""
+        git_exe = _find_git_executable()
+        if not git_exe:
+            raise InstagramPublishError("로컬 git 실행 파일을 찾지 못했습니다.")
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        proc = subprocess.run(
+            [git_exe, *args],
+            cwd=str(cwd),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if check and proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()[:300]
+            raise InstagramPublishError(f"git {' '.join(args)} 실패: {detail}")
+        return proc
+
+    def _configure_temp_git_identity(self, repo_dir: Path) -> None:
+        """임시 저장소에 커밋 작성자 이름/이메일을 설정한다."""
+        user_name = ""
+        user_email = ""
+        if (config.BASE_DIR / ".git").exists():
+            n_proc = self._run_git(
+                ["config", "--get", "user.name"], config.BASE_DIR, check=False
+            )
+            e_proc = self._run_git(
+                ["config", "--get", "user.email"], config.BASE_DIR, check=False
+            )
+            user_name = n_proc.stdout.strip()
+            user_email = e_proc.stdout.strip()
+        self._run_git(["config", "user.name", user_name or "kkubunge"], repo_dir)
+        self._run_git(
+            [
+                "config",
+                "user.email",
+                user_email or "traillog-bot@users.noreply.github.com",
+            ],
+            repo_dir,
         )
 
-        # CDN 전파 지연을 고려해 비인증 공개 URL 접근 가능 여부를 사전 검증
-        last_status = 0
-        for attempt in range(3):
-            if attempt > 0:
-                time.sleep(1.5)
-            pub_resp = self._public_session.get(raw_url, timeout=self.timeout)
-            last_status = pub_resp.status_code
-            ctype = (pub_resp.headers.get("Content-Type") or "").lower()
-            if last_status == 200 and len(pub_resp.content) > 0 and (
-                "image" in ctype or "octet-stream" in ctype
-            ):
-                return raw_url
+    def _upload_batch_via_git(
+        self, items: list[tuple[str, bytes]], message: str
+    ) -> list[str]:
+        """로컬 git CLI 자격 증명을 이용해 미디어 브랜치로 JPEG 묶음을 일괄 푸시한다."""
+        remote_url = f"https://github.com/{self.repo}.git"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            clone_proc = self._run_git(
+                ["clone", "--depth", "1", "--branch", self.branch, remote_url, "."],
+                tmp_dir,
+                check=False,
+            )
+            if clone_proc.returncode != 0:
+                self._run_git(["init", "-b", self.branch], tmp_dir)
+                self._run_git(["remote", "add", "origin", remote_url], tmp_dir)
 
-        raise InstagramPublishError(
-            f"업로드한 공개 이미지 URL 접근 검증 실패 ({raw_url}): HTTP {last_status}"
-        )
+            self._configure_temp_git_identity(tmp_dir)
+
+            for remote_path, jpg_bytes in items:
+                rel = Path(remote_path.strip("/"))
+                target = tmp_dir / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(jpg_bytes)
+
+            self._run_git(["add", "-A"], tmp_dir)
+            st_proc = self._run_git(["status", "--porcelain"], tmp_dir)
+            if st_proc.stdout.strip():
+                self._run_git(["commit", "-m", message], tmp_dir)
+                self._run_git(["push", "-u", "origin", self.branch], tmp_dir)
+
+        return [self._verify_public_raw_url(self._raw_url_for(rp)) for rp, _ in items]
+
+    def upload_jpeg_batch(
+        self, items: list[tuple[str, bytes]], message: str
+    ) -> list[str]:
+        """여러 JPEG 이미지를 업로드하고 공개 raw URL 목록을 반환한다. (PAT 403 시 git CLI 폴백)"""
+        if not items:
+            return []
+        if self.token:
+            try:
+                self.ensure_branch()
+                return [
+                    self.upload_jpeg_bytes(rp, jpg_bytes, message)
+                    for rp, jpg_bytes in items
+                ]
+            except InstagramPublishError as exc:
+                err_msg = str(exc)
+                is_perm_err = (
+                    "403" in err_msg or "Resource not accessible" in err_msg
+                )
+                if is_perm_err and _find_git_executable():
+                    logger.warning(
+                        "GitHub PAT 쓰기 권한 제한으로 로컬 git CLI 폴백을 사용합니다: %s",
+                        err_msg,
+                    )
+                    return self._upload_batch_via_git(items, message)
+                raise
+        return self._upload_batch_via_git(items, message)
+
+    def _delete_files_via_git(self, remote_paths: list[str]) -> int:
+        """로컬 git CLI를 이용해 미디어 브랜치에서 지정 파일들을 일괄 삭제한다."""
+        if not remote_paths:
+            return 0
+        remote_url = f"https://github.com/{self.repo}.git"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            clone_proc = self._run_git(
+                ["clone", "--depth", "1", "--branch", self.branch, remote_url, "."],
+                tmp_dir,
+                check=False,
+            )
+            if clone_proc.returncode != 0:
+                return 0
+            deleted = 0
+            for remote_path in remote_paths:
+                target = tmp_dir / Path(remote_path.strip("/"))
+                if target.exists() and target.is_file():
+                    target.unlink()
+                    deleted += 1
+            if deleted > 0:
+                self._configure_temp_git_identity(tmp_dir)
+                self._run_git(["add", "-A"], tmp_dir)
+                self._run_git(["commit", "-m", "Cleanup media assets"], tmp_dir)
+                self._run_git(["push", "origin", self.branch], tmp_dir)
+            return deleted
 
     def delete_files(self, remote_paths: list[str]) -> int:
         """업로드된 미디어 파일들을 GitHub 미디어 브랜치에서 삭제한다."""
+        if not remote_paths:
+            return 0
+        if not self.token:
+            return self._delete_files_via_git(remote_paths)
+
         deleted = 0
         for remote_path in remote_paths:
             encoded_path = self._encode_path(remote_path)
@@ -269,6 +435,11 @@ class GitHubMediaHost:
             )
             if resp.status_code == 200:
                 deleted += 1
+            elif resp.status_code == 403 and _find_git_executable():
+                logger.warning("GitHub PAT 삭제 권한 제한으로 git CLI 정리를 사용합니다.")
+                return deleted + self._delete_files_via_git(
+                    remote_paths[remote_paths.index(remote_path) :]
+                )
             else:
                 logger.warning("미디어 정리 실패(%s): HTTP %s", remote_path, resp.status_code)
         return deleted
@@ -455,21 +626,17 @@ class InstagramCarouselPublisher:
         if creds["quota"]["remaining"] <= 0:
             raise InstagramPublishError("인스타그램 일일 게시 한도(quota)를 모두 소진했습니다.")
 
-        media_host.ensure_branch()
         slug = _sanitize_slug(course_key)
         ts_tag = datetime.now(KST).strftime("%Y%m%d_%H%M%S")
-        remote_paths: list[str] = []
-        image_urls: list[str] = []
-
-        for slide_path, jpg_bytes, _ in jpeg_items:
-            remote_path = f"media/{slug}_{ts_tag}/{slide_path.stem}.jpg"
-            url = media_host.upload_jpeg_bytes(
-                remote_path,
-                jpg_bytes,
-                message=f"Upload carousel slide {slide_path.stem} for {course_name or slug}",
-            )
-            remote_paths.append(remote_path)
-            image_urls.append(url)
+        batch_items = [
+            (f"media/{slug}_{ts_tag}/{slide_path.stem}.jpg", jpg_bytes)
+            for slide_path, jpg_bytes, _ in jpeg_items
+        ]
+        remote_paths = [rp for rp, _ in batch_items]
+        image_urls = media_host.upload_jpeg_batch(
+            batch_items,
+            message=f"Upload carousel slides for {course_name or slug}",
+        )
 
         if len(image_urls) == 1:
             root_creation_id = self._create_media_container(
@@ -645,7 +812,10 @@ def main(argv: list[str] | None = None) -> int:
         print("인스타그램 & GitHub 연결 점검 통과")
         print(f"- IG 계정: @{acc['username']} (ID: {acc['id']}, 게시물: {acc['media_count']}개)")
         print(f"- 일일 게시 한도: {quota['usage']} / {quota['total']} (잔여 {quota['remaining']}건)")
-        print(f"- GitHub 저장소: {repo['full_name']} (Public={not repo['private']}, 기본 브랜치: {repo['default_branch']}, 미디어 브랜치: {repo['media_branch']})")
+        print(
+            f"- GitHub 저장소: {repo['full_name']} (Public={not repo['private']}, "
+            f"기본 브랜치: {repo['default_branch']}, 미디어 브랜치: {repo['media_branch']})"
+        )
         return 0
 
     if args.dir:
