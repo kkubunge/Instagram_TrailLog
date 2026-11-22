@@ -1,0 +1,17 @@
+# 환경 설정 및 민감한 키
+.env
+token.txt
+*.secret
+*.key
+
+# 인증키 포함 내부 문서 및 대용량 참고 자료
+_Doc/
+
+# 파이썬 가상환경 및 캐시
+.venv/
+__pycache__/
+*.py[cod]
+
+# 생성된 카드뉴스 및 미리보기 결과
+output/
+*.log
