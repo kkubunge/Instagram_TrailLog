@@ -91,12 +91,40 @@ def is_course_published(crs_idx: str, history_path: Path | None = None) -> bool:
 def record_published_course(
     entry: dict[str, Any], history_path: Path | None = None
 ) -> None:
-    """새로 게시된 코스 이력을 published_history.json에 추가한다."""
+    """새로 게시된 코스 이력을 published_history.json에 저장(동일 crs_idx는 최신 정보로 갱신)한다."""
     history = load_published_history(history_path)
-    items = [x for x in history.get("published", []) if isinstance(x, dict)]
+    crs_idx = str(entry.get("crs_idx") or "").strip()
+    items = [
+        x
+        for x in history.get("published", [])
+        if isinstance(x, dict) and (not crs_idx or str(x.get("crs_idx") or "").strip() != crs_idx)
+    ]
     items.append(entry)
     history["published"] = items
     save_published_history(history, history_path)
+
+
+def count_published_today_kst(history_path: Path | None = None) -> int:
+    """published_history.json 기준으로 오늘(KST) 게시된 건수를 반환한다."""
+    history = load_published_history(history_path)
+    today_kst = datetime.now(KST).date()
+    count = 0
+    for item in history.get("published", []):
+        if not isinstance(item, dict):
+            continue
+        raw_ts = str(item.get("published_at") or "").strip()
+        if not raw_ts:
+            continue
+        norm_ts = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", raw_ts.replace("Z", "+00:00"))
+        try:
+            dt = datetime.fromisoformat(norm_ts)
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=KST)
+        if dt.astimezone(KST).date() == today_kst:
+            count += 1
+    return count
 
 
 def convert_slide_to_jpeg_bytes(image_path: Path, quality: int = 92) -> bytes:
@@ -637,21 +665,26 @@ class InstagramCarouselPublisher:
             batch_items,
             message=f"Upload carousel slides for {course_name or slug}",
         )
+        label = course_name or slug
+        logger.info("[%s] 공개 이미지 %d장 호스팅 완료 (%s)", label, len(image_urls), style or "-")
 
         if len(image_urls) == 1:
+            logger.info("[%s] 단일 이미지 컨테이너 등록 중...", label)
             root_creation_id = self._create_media_container(
                 {"image_url": image_urls[0], "caption": final_caption}
             )
             self._wait_container_finished(root_creation_id)
         else:
             child_ids: list[str] = []
-            for img_url in image_urls:
+            for idx, img_url in enumerate(image_urls, start=1):
+                logger.info("[%s] 슬라이드 컨테이너 등록 중 [%d/%d]", label, idx, len(image_urls))
                 child_id = self._create_media_container(
                     {"image_url": img_url, "is_carousel_item": "true"}
                 )
                 self._wait_container_finished(child_id)
                 child_ids.append(child_id)
 
+            logger.info("[%s] 캐러셀 묶음 생성 및 게시 요청 중...", label)
             root_creation_id = self._create_media_container(
                 {
                     "media_type": "CAROUSEL",
@@ -677,6 +710,7 @@ class InstagramCarouselPublisher:
             timestamp = str(meta.get("timestamp") or "")
         except Exception as exc:
             logger.warning("게시물 퍼머링크 조회 실패(게시는 완료됨): %s", exc)
+        logger.info("[%s] 인스타그램 게시 완료: %s", label, permalink or media_id)
 
         published_at = timestamp or datetime.now(KST).isoformat()
         record_entry = {

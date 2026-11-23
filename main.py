@@ -13,7 +13,11 @@ import config
 from caption_writer import generate_instagram_copy
 from card_renderer import COMPARE_STYLES, STYLE_META, render_carousel_cards
 from durunubi_api import DurunubiClient
-from instagram_publisher import InstagramCarouselPublisher, load_published_history
+from instagram_publisher import (
+    InstagramCarouselPublisher,
+    count_published_today_kst,
+    load_published_history,
+)
 from preview_builder import build_instagram_preview, build_style_compare_page
 from theme_selector import select_theme_style
 from tour_photo_api import TourPhotoClient
@@ -28,6 +32,39 @@ logger = logging.getLogger("traillog")
 def _sanitize_dirname(name: str) -> str:
     """폴더 이름에 사용할 수 없는 문자를 언더스코어로 치환한다."""
     return re.sub(r'[\\/:*?"<>|\s]+', "_", name).strip("_")[:50] or "course"
+
+
+def _interleave_courses_by_route(
+    courses: list[dict[str, object]],
+    route_map: dict[str, dict[str, object]],
+) -> list[dict[str, object]]:
+    """노선(DMZ 평화의 길 · 해파랑길 · 남파랑길 · 서해랑길 등)별로 코스를 번갈아 정렬한다."""
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for item in courses:
+        r_idx = str(item.get("routeIdx") or "").strip() or "_unknown"
+        grouped.setdefault(r_idx, []).append(item)
+
+    def _route_priority(r_idx: str) -> tuple[int, str]:
+        name = str((route_map.get(r_idx) or {}).get("themeNm") or "")
+        for order, kw in enumerate(("DMZ", "해파랑길", "남파랑길", "서해랑길")):
+            if kw in name:
+                return (order, r_idx)
+        return (99, r_idx)
+
+    ordered_keys = sorted(grouped.keys(), key=_route_priority)
+    result: list[dict[str, object]] = []
+    idx = 0
+    while True:
+        added = False
+        for key in ordered_keys:
+            bucket = grouped[key]
+            if idx < len(bucket):
+                result.append(bucket[idx])
+                added = True
+        if not added:
+            break
+        idx += 1
+    return result
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -95,6 +132,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="인스타그램 게시 완료 후 GitHub 미디어 브랜치의 업로드 이미지 정리",
     )
+    parser.add_argument(
+        "--round-robin",
+        action="store_true",
+        help="미게시 코스를 노선별(DMZ·해파랑길·남파랑길·서해랑길)로 번갈아 선택",
+    )
+    parser.add_argument(
+        "--max-daily",
+        type=int,
+        default=0,
+        help="하루(KST) 최대 게시 건수 제한 (0이면 제한 없음, --publish 시 적용)",
+    )
     return parser.parse_args(argv)
 
 
@@ -103,12 +151,22 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     brd_div = config.resolve_brd_div(args.brd)
 
+    target_count = max(1, args.count)
+    if args.publish and args.max_daily > 0:
+        today_count = count_published_today_kst()
+        if today_count >= args.max_daily:
+            print(
+                f"오늘(KST) 이미 {today_count}건 게시되어 일일 상한({args.max_daily}건)에 도달했습니다. 작업을 종료합니다."
+            )
+            return 0
+        target_count = min(target_count, args.max_daily - today_count)
+
     client = DurunubiClient()
     routes = client.get_route_list(brd_div=brd_div, num_of_rows=100)
     route_map = {str(r.get("routeIdx", "")): r for r in routes if r.get("routeIdx")}
 
     start_idx = max(1, args.index)
-    fetch_count = start_idx - 1 + max(1, args.count)
+    fetch_count = start_idx - 1 + target_count
     published_ids: set[str] = set()
     if args.skip_published:
         history = load_published_history()
@@ -118,10 +176,11 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(item, dict) and item.get("crs_idx")
         }
 
+    collect_all_for_rr = bool(args.round_robin and not args.keyword)
     courses: list[dict[str, object]] = []
-    if args.skip_published:
+    if args.skip_published or collect_all_for_rr:
         page_no = 1
-        while len(courses) < fetch_count and page_no <= 10:
+        while page_no <= 10 and (collect_all_for_rr or len(courses) < fetch_count):
             batch = client.get_course_list(
                 crs_kor_nm=args.keyword,
                 crs_level=args.level,
@@ -132,8 +191,9 @@ def main(argv: list[str] | None = None) -> int:
             if not batch:
                 break
             for item in batch:
-                if str(item.get("crsIdx") or "").strip() not in published_ids:
-                    courses.append(item)
+                if args.skip_published and str(item.get("crsIdx") or "").strip() in published_ids:
+                    continue
+                courses.append(item)
             if len(batch) < 100:
                 break
             page_no += 1
@@ -146,11 +206,14 @@ def main(argv: list[str] | None = None) -> int:
             page_no=1,
         )
 
+    if args.round_robin and courses:
+        courses = _interleave_courses_by_route(courses, route_map)
+
     if not courses:
         print("조건에 해당하는 두루누비 코스를 찾지 못했습니다.")
         return 1
 
-    targets = courses[start_idx - 1 : start_idx - 1 + args.count]
+    targets = courses[start_idx - 1 : start_idx - 1 + target_count]
     if not targets:
         print(f"요청한 순번({start_idx})에 해당하는 코스가 없습니다. (조회 건수: {len(courses)}건)")
         return 1

@@ -2,8 +2,8 @@ name: Auto Publish TrailLog Carousel
 
 on:
   schedule:
-    # 매일 오전 9시 KST (UTC 00:00) 자동 실행
-    - cron: "0 0 * * *"
+    # 매일 오전 9시~오후 5시, 2시간 간격 5회 실행 (KST 09:00, 11:00, 13:00, 15:00, 17:00)
+    - cron: "0 0,2,4,6,8 * * *"
   workflow_dispatch:
     inputs:
       brd:
@@ -15,7 +15,7 @@ on:
           - 걷기
           - 자전거
       keyword:
-        description: "코스명 검색 키워드 (선택, 비우면 미게시 코스 자동 선택)"
+        description: "코스명 검색 키워드 (선택, 비우면 미게시 코스 노선 순환 선택)"
         required: false
         default: ""
         type: string
@@ -36,6 +36,10 @@ on:
 
 permissions:
   contents: write
+
+concurrency:
+  group: traillog-publish
+  cancel-in-progress: false
 
 jobs:
   publish-carousel:
@@ -87,7 +91,7 @@ jobs:
           GITHUB_REPO: ${{ github.repository }}
           GITHUB_MEDIA_BRANCH: media-assets
         run: |
-          ARGS=(--brd "${{ inputs.brd || '걷기' }}" --style "${{ inputs.style || 'auto' }}" --skip-published --count 1)
+          ARGS=(--brd "${{ inputs.brd || '걷기' }}" --style "${{ inputs.style || 'auto' }}" --skip-published --round-robin --max-daily 5 --count 1)
           if [ -n "${{ inputs.keyword }}" ]; then
             ARGS+=(--keyword "${{ inputs.keyword }}")
           fi
@@ -106,5 +110,6 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add published_history.json
             git commit -m "chore: update published_history.json [skip ci]"
-            git push
+            git pull --rebase origin main
+            git push origin main
           fi
