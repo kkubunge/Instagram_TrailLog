@@ -33,12 +33,15 @@ API 데이터를 분석해 **숲·산 코스는 `forest`(아웃도어 포레스�
 - **일일 상한 (`--max-daily 5`)**: `published_history.json` 기준 당일(KST) 게시 건수가 5건에 도달하면 초과 발행 없이 안전하게 종료하고, 게시 완료 시 `published_history.json`을 `main`에 자동 커밋합니다.
 
 ### 최초 1회 설정 방법
-1. 저장소 **Settings → Secrets and variables → Actions → New repository secret**에서 아래 4개 시크릿을 등록합니다.
+1. 저장소 **Settings → Secrets and variables → Actions → New repository secret**에서 아래 시크릿을 등록합니다.
    - `DURUNUBI_API_KEY`: 공공데이터포털 두루누비(및 KorService2) 인증키
    - `GEMINI_API_KEY`: Gemini API 키 (미설정 시 규칙 기반 폴백)
    - `IG_USER_ID`: 인스타그램 비즈니스 계정 ID (`17841426808330372`)
    - `IG_ACCESS_TOKEN`: Meta Graph API 액세스 토큰 (`instagram_content_publish` 권한 포함)
-2. 저장소 **Actions → Auto Publish TrailLog Carousel → Run workflow**에서 `dry_run: true`로 1회 수동 테스트해 정상 동작을 확인합니다.
+   - `SLACK_BOT_TOKEN`: *(선택)* 실행 완료/실패 자동 보고용 Slack Bot Token (`xoxb-...`)
+   - `SLACK_REPORT_CHANNEL_ID`: *(선택)* 정기 Cron 및 수동 실행 시 기본 Slack 보고 채널 또는 DM ID (예: `D0CL64CQGJY`)
+2. 실행이 완료되면 새로 게시된 코스명, 스타일(`forest`/`ocean`), 슬라이드 수, 인스타그램 게시물 링크가 Slack으로 자동 보고됩니다.
+3. 저장소 **Actions → Auto Publish TrailLog Carousel → Run workflow**에서 `dry_run: true`로 1회 수동 테스트해 정상 동작을 확인합니다.
 
 ---
 
