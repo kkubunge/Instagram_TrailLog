@@ -44,6 +44,10 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 GITHUB_REPO = os.getenv("GITHUB_REPO", "kkubunge/Instagram_TrailLog").strip()
 GITHUB_MEDIA_BRANCH = os.getenv("GITHUB_MEDIA_BRANCH", "media-assets").strip()
 
+# Slack 완료 보고 설정 (로컬 직접 실행 시 사용, GitHub Actions에서는 워크플로우 스텝이 보고)
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "").strip()
+SLACK_REPORT_CHANNEL_ID = os.getenv("SLACK_REPORT_CHANNEL_ID", "").strip()
+
 # 두루누비 걷기/자전거 구분 코드 매핑
 BRD_DIV_MAP: dict[str, str] = {
     "걷기": "DNWW",

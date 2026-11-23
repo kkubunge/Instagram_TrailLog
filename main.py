@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -33,6 +34,51 @@ logger = logging.getLogger("traillog")
 def _sanitize_dirname(name: str) -> str:
     """폴더 이름에 사용할 수 없는 문자를 언더스코어로 치환한다."""
     return re.sub(r'[\\/:*?"<>|\s]+', "_", name).strip("_")[:50] or "course"
+
+
+def _escape_slack(val: object) -> str:
+    """Slack mrkdwn 링크 깨짐을 막기 위해 특수문자를 이스케이프한다."""
+    return str(val or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def notify_slack_published(pub_res: dict[str, object], total_published: int) -> bool:
+    """로컬 직접 실행으로 인스타그램 게시 완료 시 Slack DM 본문으로 알림을 전송한다."""
+    # GitHub Actions에서는 워크플로우 마지막 스텝이 통합 보고하므로 중복 알림 방지
+    if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
+        return False
+    if not config.SLACK_BOT_TOKEN or not config.SLACK_REPORT_CHANNEL_ID:
+        return False
+
+    course_name = _escape_slack(pub_res.get("course_name") or pub_res.get("crs_idx") or "코스")
+    style = _escape_slack(pub_res.get("style") or "-")
+    slides = pub_res.get("slide_count", "-")
+    permalink = str(pub_res.get("permalink") or "").strip()
+    link_part = f" — <{permalink}|인스타그램 게시물 보기>" if permalink else ""
+
+    lines = [
+        ":camera_with_flash: *TrailLog 인스타그램 게시 완료 (로컬 실행)*",
+        f"• 코스: *{course_name}* (스타일: `{style}`, 슬라이드 `{slides}장`){link_part}",
+        f"• 누적 게시: 총 {total_published}건",
+    ]
+    try:
+        session = config.create_http_session()
+        resp = session.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={
+                "Authorization": f"Bearer {config.SLACK_BOT_TOKEN}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json={"channel": config.SLACK_REPORT_CHANNEL_ID, "text": "\n".join(lines)},
+            timeout=15,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            logger.warning("Slack 알림 전송 실패: %s", data.get("error"))
+            return False
+        return True
+    except Exception as exc:
+        logger.warning("Slack 알림 전송 중 예외 (무시됨): %s", exc)
+        return False
 
 
 def _interleave_courses_by_route(
@@ -350,6 +396,9 @@ def main(argv: list[str] | None = None) -> int:
                     encoding="utf-8",
                 )
                 print(f"- 인스타그램 게시 완료: {pub_res.get('permalink') or pub_res.get('media_id')}")
+                total_published = len(load_published_history().get("published", []))
+                if notify_slack_published(pub_res, total_published):
+                    print("- Slack 알림 전송 완료")
             else:
                 acc = pub_res.get("account") or {}
                 quota = pub_res.get("quota") or {}
