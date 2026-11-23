@@ -17,11 +17,14 @@ from card_common import (
     draw_elevation_chart,
     draw_footer,
     draw_lines,
+    draw_map_spot_markers,
     draw_pill,
+    extract_map_spots,
     fit_wrapped_text,
     get_footer_source_text,
     load_fitted_image,
     paste_rounded_image,
+    project_gpx_and_spots,
     project_gpx_points,
     wrap_text,
 )
@@ -476,7 +479,13 @@ def _render_route_map(
 
     gpx = bundle.get("gpx") or {}
     points = gpx.get("points") or []
-    coords = project_gpx_points(points, inner, max_points=260)
+    map_spots = extract_map_spots(bundle, points)
+    coords, projected_spots = project_gpx_and_spots(points, map_spots, inner, max_points=260)
+
+    f_badge = fonts.get("bold", 21)
+    cycle_str = f"{bundle['cycle_type']} · {bundle['distance_text']}"
+    cw = int(draw.textlength(cycle_str, font=f_badge)) + 36
+    badge_x0 = WIDTH - 104 - cw
 
     if len(coords) >= 2:
         overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
@@ -491,21 +500,34 @@ def _render_route_map(
         draw.ellipse((ex - 18, ey - 18, ex + 18, ey + 18), fill=C_OCEAN_DARK, outline=C_WHITE, width=4)
         draw.text((sx - 7, sy - 12), "S", font=fonts.get("bold", 20), fill=C_WHITE)
         draw.text((ex - 6, ey - 12), "E", font=fonts.get("bold", 20), fill=C_WHITE)
+        draw_map_spot_markers(
+            draw,
+            fonts,
+            projected_spots,
+            gpx_coords=coords,
+            start_end_coords=(coords[0], coords[-1]),
+            bounds=(96, 350, WIDTH - 96, 756),
+            avoid_boxes=[(badge_x0 - 8, 316, WIDTH - 96, 368)],
+            accent_color=C_OCEAN,
+            text_color=C_INK,
+            chip_bg=C_WHITE,
+            chip_border=C_SKY_ACCENT,
+        )
     else:
         msg = "GPX 경로 데이터가 제공되지 않는 코스입니다."
         mw = draw.textlength(msg, font=fonts.get("medium", 28))
         draw.text(((WIDTH - mw) / 2, 535), msg, font=fonts.get("medium", 28), fill=C_MUTED)
 
-    f_badge = fonts.get("bold", 21)
-    cycle_str = f"{bundle['cycle_type']} · {bundle['distance_text']}"
-    cw = int(draw.textlength(cycle_str, font=f_badge)) + 36
-    draw_pill(draw, WIDTH - 104 - cw, 324, cycle_str, f_badge, C_BLUE_SOFT, C_OCEAN, pad_x=18, pad_y=8)
+    draw_pill(draw, badge_x0, 324, cycle_str, f_badge, C_BLUE_SOFT, C_OCEAN, pad_x=18, pad_y=8)
 
     f_legend = fonts.get("medium", 21)
     draw.ellipse((116, 772, 134, 790), fill=C_SKY_ACCENT)
     draw.text((144, 768), "출발(S)", font=f_legend, fill=C_INK)
-    draw.ellipse((248, 772, 266, 790), fill=C_OCEAN_DARK)
-    draw.text((276, 768), "도착(E)", font=f_legend, fill=C_INK)
+    draw.ellipse((242, 772, 260, 790), fill=C_OCEAN_DARK)
+    draw.text((270, 768), "도착(E)", font=f_legend, fill=C_INK)
+    if projected_spots:
+        draw.ellipse((368, 771, 388, 791), fill=C_WHITE, outline=C_OCEAN, width=3)
+        draw.text((397, 768), f"스팟(1~{len(projected_spots)})", font=f_legend, fill=C_INK)
     pt_info = f"GPX {gpx.get('point_count', 0):,} PTS"
     pw = draw.textlength(pt_info, font=f_legend)
     draw.text((WIDTH - 110 - pw, 768), pt_info, font=f_legend, fill=C_OCEAN)
@@ -533,6 +555,8 @@ def _render_route_map(
         label_color=C_MUTED,
         line_color=C_SKY_ACCENT,
         fill_rgba=C_SKY_FILL,
+        spot_markers=projected_spots,
+        marker_color=C_OCEAN,
     )
     draw = ImageDraw.Draw(img)
     _draw_ocean_footer(

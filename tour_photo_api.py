@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 import re
 import shutil
 from pathlib import Path
@@ -253,11 +254,46 @@ class TourPhotoClient:
             return []
 
     @staticmethod
+    def _parse_lat_lon(item: dict[str, Any]) -> tuple[float | None, float | None]:
+        """KorService2 응답 항목에서 유효한 위경도(lat, lon)를 추출한다."""
+        try:
+            lat = float(item.get("mapy"))  # type: ignore[arg-type]
+            lon = float(item.get("mapx"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None, None
+        if not (32.0 <= lat <= 39.5 and 124.0 <= lon <= 132.5):
+            return None, None
+        return lat, lon
+
+    @staticmethod
+    def _min_distance_to_gpx_km(
+        lat: float,
+        lon: float,
+        gpx_points: list[tuple[float, float, float | None]] | None,
+    ) -> float | None:
+        """스팟 좌표에서 GPX 경로까지 최소 직선 거리(km)를 계산한다."""
+        if not gpx_points:
+            return None
+        step = max(1, len(gpx_points) // 250)
+        sampled = gpx_points[::step]
+        if sampled[-1] != gpx_points[-1]:
+            sampled.append(gpx_points[-1])
+        cos_lat = math.cos(math.radians(lat)) or 1.0
+        min_d = min(
+            math.hypot((p[0] - lat) * 111.0, (p[1] - lon) * 111.0 * cos_lat)
+            for p in sampled
+        )
+        return round(min_d, 2)
+
+    @classmethod
     def _pick_best_item(
-        items: list[dict[str, Any]], used_ids: set[str]
-    ) -> dict[str, Any] | None:
-        """허용 타입(12/14/25/28)과 이미지 보유 여부, 중복 제외 기준으로 최적 항목을 고른다."""
-        candidates: list[dict[str, Any]] = []
+        cls,
+        items: list[dict[str, Any]],
+        used_ids: set[str],
+        gpx_points: list[tuple[float, float, float | None]] | None = None,
+    ) -> tuple[dict[str, Any], float | None, float | None, float | None] | None:
+        """허용 타입(12/14/25/28), 이미지 보유 여부, 중복 제외 및 GPX 근접도 기준으로 최적 항목을 고른다."""
+        candidates: list[tuple[dict[str, Any], float | None, float | None, float | None]] = []
         for item in items:
             cid = str(item.get("contentid") or "").strip()
             ctype = str(item.get("contenttypeid") or "").strip()
@@ -268,12 +304,29 @@ class TourPhotoClient:
                 continue
             if ctype not in ALLOWED_CONTENT_TYPES:
                 continue
-            candidates.append(item)
+            lat, lon = cls._parse_lat_lon(item)
+            dist = (
+                cls._min_distance_to_gpx_km(lat, lon, gpx_points)
+                if (lat is not None and lon is not None and gpx_points)
+                else None
+            )
+            candidates.append((item, lat, lon, dist))
 
         if not candidates:
             return None
 
-        candidates.sort(key=lambda x: _TYPE_PRIORITY.get(str(x.get("contenttypeid")), 99))
+        if gpx_points:
+            candidates.sort(
+                key=lambda x: (
+                    0 if (x[3] is not None and x[3] <= 5.0) else 1,
+                    _TYPE_PRIORITY.get(str(x[0].get("contenttypeid")), 99),
+                    x[3] if x[3] is not None else 999.0,
+                )
+            )
+        else:
+            candidates.sort(
+                key=lambda x: _TYPE_PRIORITY.get(str(x[0].get("contenttypeid")), 99)
+            )
         return candidates[0]
 
     def _download_image(self, url: str, target_base: Path) -> Path | None:
@@ -307,13 +360,15 @@ class TourPhotoClient:
         ldong_regn_cd: str | None,
         used_ids: set[str],
         target_base: Path,
+        gpx_points: list[tuple[float, float, float | None]] | None = None,
     ) -> dict[str, Any] | None:
         """키워드 후보를 순차 검색해 중복 없는 최적 관광사진 1장을 내려받는다."""
         for kw in keywords:
             items = self.search_keyword(kw, ldong_regn_cd=ldong_regn_cd, num_of_rows=6)
-            picked = self._pick_best_item(items, used_ids)
-            if not picked:
+            chosen = self._pick_best_item(items, used_ids, gpx_points=gpx_points)
+            if not chosen:
                 continue
+            picked, lat, lon, dist_km = chosen
             img_url = str(picked.get("firstimage") or "").strip()
             local_path = self._download_image(img_url, target_base)
             if not local_path:
@@ -321,7 +376,7 @@ class TourPhotoClient:
 
             cid = str(picked.get("contentid") or "").strip()
             used_ids.add(cid)
-            return {
+            meta: dict[str, Any] = {
                 "title": str(picked.get("title") or kw).strip(),
                 "content_id": cid,
                 "content_type_id": str(picked.get("contenttypeid") or "").strip(),
@@ -329,6 +384,12 @@ class TourPhotoClient:
                 "url": img_url,
                 "local_path": str(local_path),
             }
+            if lat is not None and lon is not None:
+                meta["lat"] = lat
+                meta["lon"] = lon
+                if dist_km is not None:
+                    meta["dist_to_gpx_km"] = dist_km
+            return meta
         return None
 
     def collect_course_photos(
@@ -337,6 +398,7 @@ class TourPhotoClient:
         """코스 번들의 대표 커버 사진과 스팟별 실사 사진을 수집해 로컬에 저장한다."""
         photos_dir.mkdir(parents=True, exist_ok=True)
         regn_cd = config.resolve_ldong_regn(bundle.get("sigun"))
+        gpx_points = (bundle.get("gpx") or {}).get("points") or None
         used_ids: set[str] = set()
 
         # 1) 코스/길명 기반 커버 사진 탐색
@@ -348,7 +410,7 @@ class TourPhotoClient:
             )
         )
         cover_photo = self._find_and_download(
-            cover_keywords, regn_cd, used_ids, photos_dir / "cover"
+            cover_keywords, regn_cd, used_ids, photos_dir / "cover", gpx_points=gpx_points
         )
 
         # 2) 스팟별 사진 탐색 (원본 순서 유지)
@@ -359,7 +421,11 @@ class TourPhotoClient:
             photo_meta = None
             if kws:
                 photo_meta = self._find_and_download(
-                    kws, regn_cd, used_ids, photos_dir / f"spot_{idx:02d}"
+                    kws,
+                    regn_cd,
+                    used_ids,
+                    photos_dir / f"spot_{idx:02d}",
+                    gpx_points=gpx_points,
                 )
             all_spot_entries.append({"text": spot_text, "photo": photo_meta})
 

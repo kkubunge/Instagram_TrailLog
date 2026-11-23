@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -195,15 +196,12 @@ def draw_footer(
     draw.text((WIDTH - 76 - pw, HEIGHT - 74), page_str, font=f_page, fill=accent_color)
 
 
-def project_gpx_points(
+def _compute_gpx_projection(
     points: list[tuple[float, float, float | None]],
     box: tuple[int, int, int, int],
     max_points: int = 240,
-) -> list[tuple[float, float]]:
-    """GPX 위경도 좌표를 위도 보정(cos)과 종횡비를 유지해 지정 박스 내부 좌표로 변환한다."""
-    if len(points) < 2:
-        return []
-
+) -> tuple[list[tuple[float, float]], float, float, float, float, float, float]:
+    """GPX 궤적을 지정 박스에 맞추기 위한 변환 파라미터(cos_lat, min_x, min_y, scale, offset_x, offset_y)를 계산한다."""
     step = max(1, len(points) // max_points)
     sampled = points[::step]
     if sampled[-1] != points[-1]:
@@ -230,10 +228,310 @@ def project_gpx_points(
     offset_x = left + (box_w - span_x * scale) / 2.0
     offset_y = top + (box_h - span_y * scale) / 2.0
 
-    return [
+    coords = [
         (offset_x + (x - min_x) * scale, offset_y + (y - min_y) * scale)
         for x, y in zip(xs, ys)
     ]
+    return coords, cos_lat, min_x, min_y, scale, offset_x, offset_y
+
+
+def project_gpx_points(
+    points: list[tuple[float, float, float | None]],
+    box: tuple[int, int, int, int],
+    max_points: int = 240,
+) -> list[tuple[float, float]]:
+    """GPX 위경도 좌표를 위도 보정(cos)과 종횡비를 유지해 지정 박스 내부 좌표로 변환한다."""
+    if len(points) < 2:
+        return []
+    coords, *_ = _compute_gpx_projection(points, box, max_points=max_points)
+    return coords
+
+
+def _short_spot_label(title: str, max_chars: int = 10) -> str:
+    """지도 콜아웃 칩에 깔끔하게 들어가도록 스팟 명칭을 축약한다."""
+    cleaned = re.sub(r"\([^)]*\)", "", str(title or "")).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if len(cleaned) <= max_chars:
+        return cleaned
+
+    parts = cleaned.split(" ")
+    if len(parts) >= 2:
+        if parts[0] in ("국립", "도립", "시립", "군립", "한국"):
+            candidate = "".join(parts[1:])
+        else:
+            candidate = parts[0]
+        if len(candidate) <= max_chars + 1:
+            return candidate
+        cleaned = candidate
+
+    return cleaned[:max_chars].rstrip() + "…"
+
+
+def extract_map_spots(
+    bundle: dict[str, Any],
+    gpx_points: list[tuple[float, float, float | None]],
+    max_dist_km: float = 3.5,
+) -> list[dict[str, Any]]:
+    """코스 번들에서 GPX 경로 인근(max_dist_km 이내)의 유효 스팟 좌표와 진행률 정보를 추출한다."""
+    if len(gpx_points) < 2:
+        return []
+
+    spot_items = (bundle.get("photos") or {}).get("spot_items") or []
+    last_idx = max(1, len(gpx_points) - 1)
+    result: list[dict[str, Any]] = []
+
+    for idx, item in enumerate(spot_items, start=1):
+        photo = item.get("photo") or {}
+        try:
+            lat = float(photo.get("lat"))  # type: ignore[arg-type]
+            lon = float(photo.get("lon"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if not (32.0 <= lat <= 39.5 and 124.0 <= lon <= 132.5):
+            continue
+
+        cos_lat = math.cos(math.radians(lat)) or 1.0
+        nearest_idx = 0
+        min_d = float("inf")
+        for p_idx, pt in enumerate(gpx_points):
+            d = math.hypot((pt[0] - lat) * 111.0, (pt[1] - lon) * 111.0 * cos_lat)
+            if d < min_d:
+                min_d = d
+                nearest_idx = p_idx
+
+        if min_d > max_dist_km:
+            continue
+
+        title = str(photo.get("title") or photo.get("keyword") or f"스팟 {idx}").strip()
+        result.append(
+            {
+                "num": idx,
+                "label": _short_spot_label(title),
+                "lat": lat,
+                "lon": lon,
+                "dist_km": round(min_d, 2),
+                "progress": nearest_idx / last_idx,
+                "nearest_ele": gpx_points[nearest_idx][2],
+            }
+        )
+    return result
+
+
+def project_gpx_and_spots(
+    points: list[tuple[float, float, float | None]],
+    spots: list[dict[str, Any]],
+    box: tuple[int, int, int, int],
+    max_points: int = 260,
+) -> tuple[list[tuple[float, float]], list[dict[str, Any]]]:
+    """GPX 궤적과 스팟 좌표를 동일한 지도 변환 좌표계로 투영해 반환한다."""
+    if len(points) < 2:
+        return [], []
+    coords, cos_lat, min_x, min_y, scale, offset_x, offset_y = _compute_gpx_projection(
+        points, box, max_points=max_points
+    )
+    projected_spots: list[dict[str, Any]] = []
+    for sp in spots:
+        sx = offset_x + (float(sp["lon"]) * cos_lat - min_x) * scale
+        sy = offset_y + (-float(sp["lat"]) - min_y) * scale
+        projected_spots.append({**sp, "x": sx, "y": sy})
+    return coords, projected_spots
+
+
+def _rect_intersection_area(
+    a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+) -> float:
+    """두 사각형의 교차 면적을 계산한다."""
+    ix0 = max(a[0], b[0])
+    iy0 = max(a[1], b[1])
+    ix1 = min(a[2], b[2])
+    iy1 = min(a[3], b[3])
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    return (ix1 - ix0) * (iy1 - iy0)
+
+
+def _draw_centered_text(
+    draw: ImageDraw.ImageDraw,
+    cx: float,
+    cy: float,
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    fill: tuple[int, ...],
+) -> None:
+    """글리프 바운딩 박스를 기준으로 텍스트를 지정 중심 좌표에 정확히 그려 넣는다."""
+    bx0, by0, bx1, by1 = draw.textbbox((0, 0), text, font=font)
+    tx = cx - (bx0 + bx1) / 2.0
+    ty = cy - (by0 + by1) / 2.0
+    draw.text((tx, ty), text, font=font, fill=fill)
+
+
+def draw_map_spot_markers(
+    draw: ImageDraw.ImageDraw,
+    fonts: FontSet,
+    projected_spots: list[dict[str, Any]],
+    *,
+    gpx_coords: list[tuple[float, float]],
+    start_end_coords: tuple[tuple[float, float], tuple[float, float]] | None,
+    bounds: tuple[int, int, int, int],
+    avoid_boxes: list[tuple[float, float, float, float]],
+    accent_color: tuple[int, ...],
+    text_color: tuple[int, ...],
+    chip_bg: tuple[int, ...] = (255, 255, 255),
+    chip_border: tuple[int, ...] | None = None,
+) -> None:
+    """GPX 지도 위에 스팟 번호 링 마커와 겹침 방지 콜아웃 라벨을 그린다."""
+    if not projected_spots:
+        return
+
+    occupied: list[tuple[float, float, float, float]] = list(avoid_boxes)
+    if start_end_coords:
+        for px, py in start_end_coords:
+            occupied.append((px - 24, py - 24, px + 24, py + 24))
+
+    pin_r = 14
+    pin_centers: list[tuple[float, float]] = []
+    if start_end_coords:
+        pin_centers.extend(start_end_coords)
+
+    # 1) 마커 표시 좌표 결정 (S/E 또는 인접 스팟과 28px 이내 겹침 시 살짝 오프셋)
+    marker_layout: list[tuple[dict[str, Any], float, float]] = []
+    pin_offsets = [
+        (0, 0),
+        (30, 0),
+        (-30, 0),
+        (0, -30),
+        (0, 30),
+        (26, -26),
+        (-26, -26),
+        (26, 26),
+        (-26, 26),
+        (42, 0),
+        (-42, 0),
+    ]
+    b_left, b_top, b_right, b_bottom = bounds
+    for sp in projected_spots:
+        ax, ay = float(sp["x"]), float(sp["y"])
+        best_dx, best_dy = ax, ay
+        best_pen = float("inf")
+        for ox, oy in pin_offsets:
+            cx, cy = ax + ox, ay + oy
+            pen = math.hypot(ox, oy) * 0.2
+            if cx - pin_r < b_left or cx + pin_r > b_right or cy - pin_r < b_top or cy + pin_r > b_bottom:
+                pen += 5000.0
+            for px, py in pin_centers:
+                dist = math.hypot(cx - px, cy - py)
+                if dist < 32.0:
+                    pen += (32.0 - dist) * 120.0
+            if pen < best_pen:
+                best_pen = pen
+                best_dx, best_dy = cx, cy
+                if pen == 0.0:
+                    break
+        pin_centers.append((best_dx, best_dy))
+        occupied.append((best_dx - pin_r - 3, best_dy - pin_r - 3, best_dx + pin_r + 3, best_dy + pin_r + 3))
+        marker_layout.append((sp, best_dx, best_dy))
+
+    # 2) 콜아웃 라벨 칩 최적 위치 계산
+    f_chip = fonts.get("bold", 19)
+    f_num = fonts.get("bold", 16)
+    pad_x, pad_y = 11, 6
+    chip_h = 30
+    candidate_dirs = [
+        (1, 0),
+        (-1, 0),
+        (0.85, -0.75),
+        (-0.85, -0.75),
+        (0.85, 0.75),
+        (-0.85, 0.75),
+        (0, -1),
+        (0, 1),
+    ]
+    candidate_dists = (28, 48, 72)
+
+    placed_chips: list[tuple[dict[str, Any], float, float, tuple[int, int, int, int], str]] = []
+    sampled_gpx = gpx_coords[::2] if len(gpx_coords) > 120 else gpx_coords
+
+    for sp, mx, my in marker_layout:
+        label = str(sp.get("label") or "")
+        tw = int(draw.textlength(label, font=f_chip))
+        cw = tw + pad_x * 2
+
+        best_box = (int(mx + 22), int(my - chip_h / 2), int(mx + 22 + cw), int(my + chip_h / 2))
+        best_score = float("inf")
+
+        for dist in candidate_dists:
+            for ux, uy in candidate_dirs:
+                # 방향에 따라 박스 기준점을 자연스럽게 배치
+                cx = mx + ux * (dist + (cw / 2 if abs(ux) > 0.2 else 0))
+                cy = my + uy * (dist + (chip_h / 2 if abs(uy) > 0.2 else 0))
+                x0 = cx - cw / 2
+                y0 = cy - chip_h / 2
+                x1 = x0 + cw
+                y1 = y0 + chip_h
+                cand_box = (x0, y0, x1, y1)
+
+                score = dist * 0.45
+                if x0 < b_left:
+                    score += (b_left - x0) * 600.0
+                if x1 > b_right:
+                    score += (x1 - b_right) * 600.0
+                if y0 < b_top:
+                    score += (b_top - y0) * 600.0
+                if y1 > b_bottom:
+                    score += (y1 - b_bottom) * 600.0
+
+                padded_cand = (x0 - 4, y0 - 4, x1 + 4, y1 + 4)
+                for ob in occupied:
+                    area = _rect_intersection_area(padded_cand, ob)
+                    if area > 0:
+                        score += area * 65.0
+
+                gpx_hits = sum(
+                    1 for gx, gy in sampled_gpx if x0 - 2 <= gx <= x1 + 2 and y0 - 2 <= gy <= y1 + 2
+                )
+                score += gpx_hits * 190.0
+
+                if score < best_score:
+                    best_score = score
+                    best_box = (round(x0), round(y0), round(x1), round(y1))
+
+        occupied.append(best_box)
+        placed_chips.append((sp, mx, my, best_box, label))
+
+    # 3) 지시선(실제 좌표 앵커 -> 마커 -> 라벨) 및 도형 그리기
+    border_col = chip_border or accent_color
+    for sp, mx, my, box, _ in placed_chips:
+        ax, ay = float(sp["x"]), float(sp["y"])
+        if math.hypot(mx - ax, my - ay) > 4.0:
+            draw.line((ax, ay, mx, my), fill=accent_color, width=2)
+            draw.ellipse((ax - 4, ay - 4, ax + 4, ay + 4), fill=accent_color)
+        bx_mid = (box[0] + box[2]) / 2.0
+        by_mid = (box[1] + box[3]) / 2.0
+        draw.line((mx, my, bx_mid, by_mid), fill=border_col, width=2)
+
+    for sp, mx, my, box, label in placed_chips:
+        draw.rounded_rectangle(
+            box,
+            radius=12,
+            fill=chip_bg,
+            outline=border_col,
+            width=2,
+        )
+        _draw_centered_text(
+            draw,
+            (box[0] + box[2]) / 2.0,
+            (box[1] + box[3]) / 2.0,
+            label,
+            f_chip,
+            text_color,
+        )
+        draw.ellipse(
+            (mx - pin_r, my - pin_r, mx + pin_r, my + pin_r),
+            fill=(255, 255, 255),
+            outline=accent_color,
+            width=3,
+        )
+        _draw_centered_text(draw, mx, my, str(sp["num"]), f_num, accent_color)
 
 
 def sample_elevations(eles: list[float], max_buckets: int = 120) -> list[float]:
@@ -260,8 +558,10 @@ def draw_elevation_chart(
     label_color: tuple[int, ...],
     line_color: tuple[int, ...],
     fill_rgba: tuple[int, int, int, int],
+    spot_markers: list[dict[str, Any]] | None = None,
+    marker_color: tuple[int, ...] | None = None,
 ) -> Image.Image:
-    """지정된 영역에 고도 영역 차트와 축 눈금을 그린다."""
+    """지정된 영역에 고도 영역 차트와 축 눈금, 선택적 스팟 핀을 그린다."""
     draw = ImageDraw.Draw(img)
     chart_left, chart_top, chart_right, chart_bottom = chart_box
 
@@ -301,6 +601,37 @@ def draw_elevation_chart(
     img = Image.alpha_composite(img.convert("RGBA"), overlay)
     draw = ImageDraw.Draw(img)
     draw.line(pts_chart, fill=line_color, width=5, joint="curve")
+
+    if spot_markers and n >= 2:
+        pin_col = marker_color or line_color
+        f_pin = fonts.get("bold", 14)
+        ordered = sorted(spot_markers, key=lambda x: float(x.get("progress", 0.0)))
+        placed_pins: list[tuple[float, float]] = []
+        for sp in ordered:
+            prog = max(0.0, min(1.0, float(sp.get("progress", 0.0))))
+            f_idx = prog * (n - 1)
+            i0 = min(n - 1, int(math.floor(f_idx)))
+            i1 = min(n - 1, i0 + 1)
+            t = f_idx - i0
+            mx = pts_chart[i0][0] + (pts_chart[i1][0] - pts_chart[i0][0]) * t
+            my_line = pts_chart[i0][1] + (pts_chart[i1][1] - pts_chart[i0][1]) * t
+
+            my = my_line
+            for prev_x, prev_y in placed_pins:
+                if abs(mx - prev_x) < 26.0 and abs(my - prev_y) < 24.0:
+                    alt = my_line - 18.0 if my_line - 18.0 >= chart_top + 6 else my_line + 18.0
+                    my = alt
+            placed_pins.append((mx, my))
+
+            draw.line((mx, my, mx, chart_bottom), fill=grid_color, width=2)
+            r = 11
+            draw.ellipse(
+                (mx - r, my - r, mx + r, my + r),
+                fill=(255, 255, 255),
+                outline=pin_col,
+                width=3,
+            )
+            _draw_centered_text(draw, mx, my, str(sp.get("num", "")), f_pin, pin_col)
 
     draw.text((chart_left, chart_bottom + 14), "출발점", font=fonts.get("regular", 20), fill=label_color)
     end_lbl = "도착점"
