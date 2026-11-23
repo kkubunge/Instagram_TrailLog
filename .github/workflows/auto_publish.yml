@@ -2,8 +2,20 @@ name: Auto Publish TrailLog Carousel
 
 on:
   schedule:
-    # 매일 오전 9시~오후 5시, 2시간 간격 5회 실행 (KST 09:00, 11:00, 13:00, 15:00, 17:00)
-    - cron: "0 0,2,4,6,8 * * *"
+    # 매일 09~17시 2시간 간격 5회 본 슬롯 (UTC 정각 폭주 드롭 회피용 07분 오프셋)
+    - cron: "7 0 * * *"   # KST 09:07
+    - cron: "7 2 * * *"   # KST 11:07
+    - cron: "7 4 * * *"   # KST 13:07
+    - cron: "7 6 * * *"   # KST 15:07
+    - cron: "7 8 * * *"   # KST 17:07
+    # GitHub 스케줄 드롭 대비 30분 뒤 백업 슬롯 + 저녁 최종 보충 슬롯
+    # (정상 게시 시 --min-interval-minutes 70 및 --max-daily 5 가드로 자동 스킵)
+    - cron: "37 0 * * *"  # KST 09:37 (09시 백업)
+    - cron: "37 2 * * *"  # KST 11:37 (11시 백업)
+    - cron: "37 4 * * *"  # KST 13:37 (13시 백업)
+    - cron: "37 6 * * *"  # KST 15:37 (15시 백업)
+    - cron: "37 8 * * *"  # KST 17:37 (17시 백업)
+    - cron: "17 10 * * *" # KST 19:17 (일일 5건 미달 시 최종 보충)
   workflow_dispatch:
     inputs:
       brd:
@@ -135,6 +147,9 @@ jobs:
           Path("/tmp/traillog_before.json").write_text(json.dumps({"count": before_count}), encoding="utf-8")
           PY
           ARGS=(--brd "${{ inputs.brd || '걷기' }}" --style "${{ inputs.style || 'auto' }}" --skip-published --round-robin --max-daily 5 --count 1)
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            ARGS+=(--min-interval-minutes 70)
+          fi
           if [ -n "${{ inputs.keyword }}" ]; then
             ARGS+=(--keyword "${{ inputs.keyword }}")
           fi
@@ -207,6 +222,10 @@ jobs:
                   published = []
 
           new_items = [item for item in published[before_count:] if isinstance(item, dict)]
+
+          if ok and (not is_dry) and (not new_items) and os.environ.get("EVENT_NAME") == "schedule":
+              print("정기 백업/쿨다운 또는 일일 상한으로 신규 게시 없음 — Slack 알림을 생략합니다.")
+              raise SystemExit(0)
 
           if not ok:
               badge = f":x: *TrailLog 인스타그램 자동 게시 실패 ({job_status})*"

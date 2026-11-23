@@ -17,6 +17,7 @@ from instagram_publisher import (
     InstagramCarouselPublisher,
     count_published_today_kst,
     load_published_history,
+    minutes_since_last_publish,
 )
 from preview_builder import build_instagram_preview, build_style_compare_page
 from theme_selector import select_theme_style
@@ -143,6 +144,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         help="하루(KST) 최대 게시 건수 제한 (0이면 제한 없음, --publish 시 적용)",
     )
+    parser.add_argument(
+        "--min-interval-minutes",
+        type=int,
+        default=0,
+        help="직전 게시로부터 최소 경과 시간(분) 미달 시 자동 건너뜀 (0이면 제한 없음, --publish 시 적용)",
+    )
     return parser.parse_args(argv)
 
 
@@ -160,6 +167,14 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         target_count = min(target_count, args.max_daily - today_count)
+    if args.publish and args.min_interval_minutes > 0 and not args.force_publish:
+        elapsed_min = minutes_since_last_publish()
+        if elapsed_min is not None and elapsed_min < args.min_interval_minutes:
+            print(
+                f"최근 게시 후 {elapsed_min:.1f}분 경과해 최소 간격({args.min_interval_minutes}분) "
+                "미달이므로 이번 회차를 건너뜁니다."
+            )
+            return 0
 
     client = DurunubiClient()
     routes = client.get_route_list(brd_div=brd_div, num_of_rows=100)

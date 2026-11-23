@@ -104,6 +104,21 @@ def record_published_course(
     save_published_history(history, history_path)
 
 
+def _parse_published_at(raw_ts: str) -> datetime | None:
+    """게시 이력의 ISO 8601 타임스탬프 문자열을 타임존이 포함된 datetime으로 변환한다."""
+    text = str(raw_ts or "").strip()
+    if not text:
+        return None
+    norm_ts = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", text.replace("Z", "+00:00"))
+    try:
+        dt = datetime.fromisoformat(norm_ts)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=KST)
+    return dt
+
+
 def count_published_today_kst(history_path: Path | None = None) -> int:
     """published_history.json 기준으로 오늘(KST) 게시된 건수를 반환한다."""
     history = load_published_history(history_path)
@@ -112,19 +127,34 @@ def count_published_today_kst(history_path: Path | None = None) -> int:
     for item in history.get("published", []):
         if not isinstance(item, dict):
             continue
-        raw_ts = str(item.get("published_at") or "").strip()
-        if not raw_ts:
-            continue
-        norm_ts = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", raw_ts.replace("Z", "+00:00"))
-        try:
-            dt = datetime.fromisoformat(norm_ts)
-        except ValueError:
-            continue
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=KST)
-        if dt.astimezone(KST).date() == today_kst:
+        dt = _parse_published_at(str(item.get("published_at") or ""))
+        if dt is not None and dt.astimezone(KST).date() == today_kst:
             count += 1
     return count
+
+
+def minutes_since_last_publish(
+    history_path: Path | None = None,
+    now: datetime | None = None,
+) -> float | None:
+    """가장 최근 게시 시각으로부터 경과한 시간(분)을 반환한다. 이력이 없으면 None."""
+    history = load_published_history(history_path)
+    latest: datetime | None = None
+    for item in history.get("published", []):
+        if not isinstance(item, dict):
+            continue
+        dt = _parse_published_at(str(item.get("published_at") or ""))
+        if dt is None:
+            continue
+        dt_kst = dt.astimezone(KST)
+        if latest is None or dt_kst > latest:
+            latest = dt_kst
+    if latest is None:
+        return None
+    ref_now = now or datetime.now(KST)
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=KST)
+    return (ref_now.astimezone(KST) - latest).total_seconds() / 60.0
 
 
 def convert_slide_to_jpeg_bytes(image_path: Path, quality: int = 92) -> bytes:
