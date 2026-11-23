@@ -20,46 +20,44 @@ API 데이터를 분석해 **숲·산 코스는 `forest`(아웃도어 포레스�
 - `instagram_publisher.py`: GitHub `media-assets` 공개 브랜치 이미지 호스팅 + Meta Instagram Graph API(`v24.0`) 캐러셀 자동 업로드 및 중복 방지 이력 관리
 - `published_history.json`: 중복 게시 방지 및 일일 상한 집계용 게시 완료 코스 이력
 - `main.py`: 생성·미리보기·자동 업로드·노선 순환·일일 상한 통합 CLI 진입점
-- `run_scheduled_publish.bat`: Windows 작업 스케줄러용 일일 자동 업로드 실행 배치
-- `.github/workflows/auto_publish.yml`: GitHub Actions 자동 발행 워크플로우
+- `.github/workflows/auto_publish.yml`: GitHub Actions 클라우드 무인 자동 발행 워크플로우
 
 ---
 
-## 로컬 실행 예시
+## GitHub Actions 무인 자동 발행 (매일 5회, PC 전원 불필요)
 
-### 1) 카드뉴스 생성 & 미리보기
+[auto_publish.yml](.github/workflows/auto_publish.yml)은 로컬 PC가 꺼져 있어도 GitHub 클라우드에서 매일 **09:00 · 11:00 · 13:00 · 15:00 · 17:00 (KST)** 에 미게시 코스 1건씩 자동 생성·업로드합니다.
+
+- **Pretendard 폰트 자동 캐싱**: `Pretendard v1.3.9` TTF 3종을 캐싱해 로컬 PC와 동일한 카드뉴스 디자인 품질을 유지합니다.
+- **노선 순환 (`--round-robin`)**: `DMZ 평화의 길` · `해파랑길` · `남파랑길` · `서해랑길`을 번갈아 선택해 `forest`와 `ocean` 테마가 균형 있게 올라갑니다.
+- **일일 상한 (`--max-daily 5`)**: `published_history.json` 기준 당일(KST) 게시 건수가 5건에 도달하면 초과 발행 없이 안전하게 종료하고, 게시 완료 시 `published_history.json`을 `main`에 자동 커밋합니다.
+
+### 최초 1회 설정 방법
+1. 저장소 **Settings → Secrets and variables → Actions → New repository secret**에서 아래 4개 시크릿을 등록합니다.
+   - `DURUNUBI_API_KEY`: 공공데이터포털 두루누비(및 KorService2) 인증키
+   - `GEMINI_API_KEY`: Gemini API 키 (미설정 시 규칙 기반 폴백)
+   - `IG_USER_ID`: 인스타그램 비즈니스 계정 ID (`17841426808330372`)
+   - `IG_ACCESS_TOKEN`: Meta Graph API 액세스 토큰 (`instagram_content_publish` 권한 포함)
+2. 저장소 **Actions → Auto Publish TrailLog Carousel → Run workflow**에서 `dry_run: true`로 1회 수동 테스트해 정상 동작을 확인합니다.
+
+---
+
+## 로컬 개발/수동 실행 예시
+
 ```powershell
-# API 데이터 분석으로 숲/산(forest) 또는 바다(ocean) 자동 선택 생성 (기본값: --style auto)
+# API 데이터 분석으로 숲/산(forest) 또는 바다(ocean) 자동 선택 생성 (미리보기 전용)
 .\.venv\Scripts\python.exe main.py --brd 걷기 --count 1
 
 # 숲·산(forest) 및 바다·해안(ocean) 2종 스타일 모두 생성하고 비교 페이지 보기
 .\.venv\Scripts\python.exe main.py --brd 걷기 --style all --count 1
 
-# 특정 길 키워드 검색 후 생성 (예: 해파랑길 1코스, DMZ 평화의 길 19코스)
-.\.venv\Scripts\python.exe main.py --brd 걷기 --keyword "해파랑길 1코스" --count 1
-```
-
-### 2) `@trailllog` 인스타그램 캐러셀 자동 업로드
-```powershell
 # 계정·일일 한도 및 GitHub 공개 저장소 연결 점검
 .\.venv\Scripts\python.exe instagram_publisher.py --check
 
-# 이미 생성된 output 폴더로 사전 검증(드라이런, 실제 게시 안 함)
+# 생성된 output 폴더 사전 검증 (드라이런) / 즉시 업로드
 .\.venv\Scripts\python.exe instagram_publisher.py --dir output\T_CRS_MNG0000004239_해파랑길_1코스 --dry-run
-
-# 이미 생성된 output 폴더를 @trailllog 계정에 바로 캐러셀 업로드
 .\.venv\Scripts\python.exe instagram_publisher.py --dir output\T_CRS_MNG0000004239_해파랑길_1코스
 
-# 미게시 코스를 노선별로 순환(--round-robin)하며 하루 최대 5건(--max-daily 5) 이내에서 생성·게시
+# 미게시 코스 1건을 노선 순환·일일 상한 적용해 생성부터 실제 게시까지 실행
 .\.venv\Scripts\python.exe main.py --brd 걷기 --skip-published --round-robin --max-daily 5 --count 1 --publish
 ```
-
----
-
-## 매일 5회 자동 업로드 스케줄 (09:00 ~ 17:00, 2시간 간격)
-
-매일 **09:00 / 11:00 / 13:00 / 15:00 / 17:00 (KST)** 에 미게시 코스 1건씩 자동 생성·게시되도록 구성되어 있습니다.
-- **노선 순환 (`--round-robin`)**: DMZ 평화의 길 · 해파랑길 · 남파랑길 · 서해랑길을 번갈아 선택해 `forest`와 `ocean` 테마가 균형 있게 올라갑니다.
-- **일일 상한 (`--max-daily 5`)**: `published_history.json` 기준 당일(KST) 게시 건수가 5건에 도달하면 초과 발행 없이 안전하게 종료합니다.
-- **Windows 작업 스케줄러 (`TrailLog_Daily_5Posts`)**: 로컬 PC에서 `run_scheduled_publish.bat`을 매일 5회 실행하고 실행 로그(`logs\schedule_YYYYMMDD.log`) 및 `published_history.json`을 GitHub와 동기화합니다.
-- **GitHub Actions ([auto_publish.yml](.github/workflows/auto_publish.yml))**: `cron: "0 0,2,4,6,8 * * *"` (KST 09, 11, 13, 15, 17시) 설정. GitHub 저장소 **Settings → Secrets and variables → Actions**에 `DURUNUBI_API_KEY`, `GEMINI_API_KEY`, `IG_USER_ID`, `IG_ACCESS_TOKEN` 4개 시크릿을 등록하면 PC가 꺼져 있어도 클라우드에서 자동 실행됩니다.
