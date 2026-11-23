@@ -24,11 +24,11 @@ API 데이터를 분석해 **숲·산 코스는 `forest`(아웃도어 포레스�
 
 ---
 
-## GitHub Actions 무인 자동 발행 (매일 5회, PC 전원 불필요)
+## Cloudflare Workers Cron + GitHub Actions 무인 자동 발행 (매일 5회, PC 전원 불필요)
 
-[auto_publish.yml](.github/workflows/auto_publish.yml)은 로컬 PC가 꺼져 있어도 GitHub 클라우드에서 매일 **09:07 · 11:07 · 13:07 · 15:07 · 17:07 (KST)** 에 미게시 코스 1건씩 자동 생성·업로드합니다.
+[`Slack_AutoBot`](https://github.com/kkubunge/Slack_AutoBot)의 Cloudflare Workers Cron(`0 0,2,4,6,8 * * *`)이 로컬 PC가 꺼져 있어도 매일 **09:00 · 11:00 · 13:00 · 15:00 · 17:00 (KST)** 에 [auto_publish.yml](.github/workflows/auto_publish.yml)을 정시 실행해 미게시 코스 1건씩 자동 생성·업로드합니다.
 
-- **정각 드롭 회피 & 30분 백업 슬롯**: GitHub 정각 트래픽 폭주로 인한 스케줄 누락을 피하기 위해 매 07분 오프셋으로 실행하며, 각 회차 30분 뒤(`37분`) 백업 슬롯과 `19:17` 보충 슬롯을 함께 두고 `--min-interval-minutes 70` 가드로 중복 게시를 방지합니다.
+- **트리거 실패 즉시 경고 & 19:30 KST 감시 워치독**: GitHub 자체 Cron 드롭을 없애기 위해 Cloudflare Cron으로 이관했으며, 트리거 실패 시 즉시 Slack DM으로 알리고 매일 **19:30 KST** 일일 점검에서 누락·지연·실패·목표 미달 시 경고를 보냅니다.
 - **Pretendard 폰트 자동 캐싱**: `Pretendard v1.3.9` TTF 3종을 캐싱해 로컬 PC와 동일한 카드뉴스 디자인 품질을 유지합니다.
 - **노선 순환 (`--round-robin`)**: `DMZ 평화의 길` · `해파랑길` · `남파랑길` · `서해랑길`을 번갈아 선택해 `forest`와 `ocean` 테마가 균형 있게 올라갑니다.
 - **일일 상한 (`--max-daily 5`)**: `published_history.json` 기준 당일(KST) 게시 건수가 5건에 도달하면 초과 발행 없이 안전하게 종료하고, 게시 완료 시 `published_history.json`을 `main`에 자동 커밋합니다.
