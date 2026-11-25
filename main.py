@@ -91,14 +91,37 @@ def _interleave_courses_by_route(
         r_idx = str(item.get("routeIdx") or "").strip() or "_unknown"
         grouped.setdefault(r_idx, []).append(item)
 
+    route_keywords = ("DMZ", "해파랑길", "남파랑길", "서해랑길")
+
     def _route_priority(r_idx: str) -> tuple[int, str]:
         name = str((route_map.get(r_idx) or {}).get("themeNm") or "")
-        for order, kw in enumerate(("DMZ", "해파랑길", "남파랑길", "서해랑길")):
+        for order, kw in enumerate(route_keywords):
             if kw in name:
                 return (order, r_idx)
         return (99, r_idx)
 
     ordered_keys = sorted(grouped.keys(), key=_route_priority)
+
+    # 직전 게시된 코스의 노선 다음 순서부터 시작하도록 회전시켜 매 실행마다 첫 노선(DMZ)만 반복 선택되지 않게 한다.
+    history_items = load_published_history().get("published", [])
+    if isinstance(history_items, list) and history_items:
+        last_course_name = str((history_items[-1] or {}).get("course_name") or "")
+        last_kw_idx = next(
+            (i for i, kw in enumerate(route_keywords) if kw in last_course_name),
+            -1,
+        )
+        if last_kw_idx >= 0 and len(ordered_keys) > 1:
+            next_kw = route_keywords[(last_kw_idx + 1) % len(route_keywords)]
+            rot_pos = next(
+                (
+                    pos
+                    for pos, k in enumerate(ordered_keys)
+                    if next_kw in str((route_map.get(k) or {}).get("themeNm") or "")
+                ),
+                0,
+            )
+            if rot_pos > 0:
+                ordered_keys = ordered_keys[rot_pos:] + ordered_keys[:rot_pos]
     result: list[dict[str, object]] = []
     idx = 0
     while True:

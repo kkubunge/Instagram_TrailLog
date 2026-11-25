@@ -531,6 +531,24 @@ class InstagramCarouselPublisher:
             self._media_host = GitHubMediaHost()
         return self._media_host
 
+    _TRANSIENT_CODES = {1, 2, 4, 9, 17, 32, 613}
+    _TRANSIENT_SUBCODES = {2207027, 2207032, 2207051}
+
+    @classmethod
+    def _is_transient_graph_error(cls, resp_data: Any, status_code: int) -> bool:
+        """일시적 Rate Limit 또는 미디어 준비 지연 오류인지 판별한다."""
+        if status_code in (429, 500, 502, 503, 504):
+            return True
+        if isinstance(resp_data, dict) and "error" in resp_data:
+            err = resp_data["error"] or {}
+            code = err.get("code")
+            subcode = err.get("error_subcode")
+            if err.get("is_transient") is True:
+                return True
+            if code in cls._TRANSIENT_CODES or subcode in cls._TRANSIENT_SUBCODES:
+                return True
+        return False
+
     @staticmethod
     def _raise_for_graph_error(resp_data: Any, context: str) -> None:
         """Meta Graph API 응답 내 error 객체를 파싱해 상세 예외를 발생시킨다."""
@@ -543,27 +561,88 @@ class InstagramCarouselPublisher:
                 f"[{context}] Meta Graph API 오류 (code={code}, subcode={subcode}): {msg}"
             )
 
-    def _graph_get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+    def _graph_get(self, path: str, params: dict[str, Any], max_retries: int = 3) -> dict[str, Any]:
         query = {**params, "access_token": self.access_token}
-        resp = self.session.get(
-            f"{self.base_url}/{path.lstrip('/')}", params=query, timeout=self.timeout
-        )
-        data = resp.json()
-        self._raise_for_graph_error(data, f"GET {path}")
-        if resp.status_code >= 400:
-            raise InstagramPublishError(f"[GET {path}] HTTP {resp.status_code}")
-        return data
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        delays = (5, 12, 25)
+        for attempt in range(max_retries + 1):
+            resp = self.session.get(url, params=query, timeout=self.timeout)
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+            if attempt < max_retries and self._is_transient_graph_error(data, resp.status_code):
+                wait_sec = delays[min(attempt, len(delays) - 1)]
+                logger.warning("[GET %s] 일시적 Meta API 제한 감지 — %d초 후 재시도 (%d/%d)", path, wait_sec, attempt + 1, max_retries)
+                time.sleep(wait_sec)
+                continue
+            self._raise_for_graph_error(data, f"GET {path}")
+            if resp.status_code >= 400:
+                raise InstagramPublishError(f"[GET {path}] HTTP {resp.status_code}")
+            return data
+        return {}
 
-    def _graph_post(self, path: str, data_params: dict[str, Any]) -> dict[str, Any]:
+    def _graph_post(self, path: str, data_params: dict[str, Any], max_retries: int = 3) -> dict[str, Any]:
         payload = {**data_params, "access_token": self.access_token}
-        resp = self.session.post(
-            f"{self.base_url}/{path.lstrip('/')}", data=payload, timeout=self.timeout
-        )
-        data = resp.json()
-        self._raise_for_graph_error(data, f"POST {path}")
-        if resp.status_code >= 400:
-            raise InstagramPublishError(f"[POST {path}] HTTP {resp.status_code}")
-        return data
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        delays = (8, 18, 35)
+        for attempt in range(max_retries + 1):
+            resp = self.session.post(url, data=payload, timeout=self.timeout)
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+            if attempt < max_retries and self._is_transient_graph_error(data, resp.status_code):
+                wait_sec = delays[min(attempt, len(delays) - 1)]
+                logger.warning("[POST %s] 일시적 Meta API 제한 감지 — %d초 후 재시도 (%d/%d)", path, wait_sec, attempt + 1, max_retries)
+                time.sleep(wait_sec)
+                continue
+            self._raise_for_graph_error(data, f"POST {path}")
+            if resp.status_code >= 400:
+                raise InstagramPublishError(f"[POST {path}] HTTP {resp.status_code}")
+            return data
+        return {}
+
+    def _find_recently_published_media(
+        self, final_caption: str, course_name: str
+    ) -> dict[str, str] | None:
+        """media_publish가 code=4/2207051 등을 반환했으나 실제로는 게시 완료된 경우 최근 피드에서 회수한다."""
+        try:
+            recent = self._graph_get(
+                f"{self.ig_user_id}/media",
+                {"fields": "id,caption,permalink,timestamp", "limit": 5},
+                max_retries=2,
+            )
+        except Exception as exc:
+            logger.warning("최근 게시물 역조회 실패: %s", exc)
+            return None
+
+        first_line = ""
+        for ln in (final_caption or "").splitlines():
+            if ln.strip():
+                first_line = ln.strip()[:36]
+                break
+
+        now_utc = datetime.now(timezone.utc)
+        for item in recent.get("data") or []:
+            if not isinstance(item, dict):
+                continue
+            cap = str(item.get("caption") or "")
+            ts_str = str(item.get("timestamp") or "")
+            try:
+                norm_ts = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", ts_str)
+                dt = datetime.fromisoformat(norm_ts)
+                if abs((now_utc - dt.astimezone(timezone.utc)).total_seconds()) > 900:
+                    continue
+            except Exception:
+                pass
+            if (course_name and course_name in cap) or (first_line and first_line in cap):
+                return {
+                    "id": str(item.get("id") or "").strip(),
+                    "permalink": str(item.get("permalink") or "").strip(),
+                    "timestamp": ts_str,
+                }
+        return None
 
     def verify_credentials(self) -> dict[str, Any]:
         """인스타그램 계정 정보와 24시간 일일 게시 한도(quota)를 조회한다."""
@@ -724,22 +803,67 @@ class InstagramCarouselPublisher:
             )
             self._wait_container_finished(root_creation_id)
 
-        pub_data = self._graph_post(
-            f"{self.ig_user_id}/media_publish",
-            {"creation_id": root_creation_id},
-        )
-        media_id = str(pub_data.get("id") or "").strip()
-        if not media_id:
-            raise InstagramPublishError(f"게시 후 media_id를 받지 못했습니다: {pub_data}")
+        # 캐러셀 컨테이너 FINISHED 직후 Meta 내부 인덱싱 및 순간 버스트 제한 완화를 위해 잠시 대기
+        time.sleep(3.0)
 
+        media_id = ""
         permalink = ""
         timestamp = ""
-        try:
-            meta = self._graph_get(media_id, {"fields": "id,permalink,timestamp"})
-            permalink = str(meta.get("permalink") or "")
-            timestamp = str(meta.get("timestamp") or "")
-        except Exception as exc:
-            logger.warning("게시물 퍼머링크 조회 실패(게시는 완료됨): %s", exc)
+        publish_delays = (12, 25, 45)
+        for pub_attempt in range(len(publish_delays) + 1):
+            try:
+                pub_data = self._graph_post(
+                    f"{self.ig_user_id}/media_publish",
+                    {"creation_id": root_creation_id},
+                    max_retries=0,
+                )
+                media_id = str(pub_data.get("id") or "").strip()
+                if media_id:
+                    break
+            except InstagramPublishError as exc:
+                logger.warning("[%s] media_publish 응답 오류 감지 (시도 %d): %s", label, pub_attempt + 1, exc)
+                time.sleep(4.0)
+                recovered = self._find_recently_published_media(final_caption, course_name)
+                if recovered and recovered.get("id"):
+                    media_id = recovered["id"]
+                    permalink = recovered.get("permalink", "")
+                    timestamp = recovered.get("timestamp", "")
+                    logger.info(
+                        "[%s] Meta 오류 응답에도 실제 인스타그램 게시 완료 확인(자가 복구): id=%s, url=%s",
+                        label,
+                        media_id,
+                        permalink,
+                    )
+                    break
+                err_text = str(exc)
+                is_retryable = any(
+                    tok in err_text
+                    for tok in ("code=4", "code=9", "code=1", "code=2", "2207051", "2207027", "2207032", "HTTP 429", "HTTP 5")
+                )
+                if pub_attempt < len(publish_delays) and is_retryable:
+                    wait_sec = publish_delays[pub_attempt]
+                    logger.warning("[%s] %d초 대기 후 media_publish 재시도합니다...", label, wait_sec)
+                    time.sleep(wait_sec)
+                    recovered = self._find_recently_published_media(final_caption, course_name)
+                    if recovered and recovered.get("id"):
+                        media_id = recovered["id"]
+                        permalink = recovered.get("permalink", "")
+                        timestamp = recovered.get("timestamp", "")
+                        logger.info("[%s] 대기 중 게시 완료 확인(자가 복구): id=%s", label, media_id)
+                        break
+                    continue
+                raise
+
+        if not media_id:
+            raise InstagramPublishError("게시 후 media_id를 받지 못했습니다.")
+
+        if not permalink:
+            try:
+                meta = self._graph_get(media_id, {"fields": "id,permalink,timestamp"})
+                permalink = str(meta.get("permalink") or "")
+                timestamp = str(meta.get("timestamp") or "")
+            except Exception as exc:
+                logger.warning("게시물 퍼머링크 조회 실패(게시는 완료됨): %s", exc)
         logger.info("[%s] 인스타그램 게시 완료: %s", label, permalink or media_id)
 
         published_at = timestamp or datetime.now(KST).isoformat()

@@ -140,7 +140,7 @@ jobs:
           else
             ARGS+=(--publish)
           fi
-          python main.py "${ARGS[@]}" | tee /tmp/traillog_run.log
+          python main.py "${ARGS[@]}" 2>&1 | tee /tmp/traillog_run.log
 
       - name: 게시 이력(published_history.json) 자동 커밋
         if: ${{ inputs.dry_run != true }}
